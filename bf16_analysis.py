@@ -9,11 +9,11 @@ BF16 has the following IEEE-754 layout (bit 15 is the sign bit)::
     [ sign (1) ][ exponent (8) ][ fraction (7) ]
                   ^ bit 14 ... bit 7
 
-``exponent_window_statistics`` examines every sliding window in the exponent
-field.  For example, a width-3 window has six possible positions.  The
-returned ``top`` entry is the most frequent *value at any position*, with the
-fraction calculated against all elements in the tensor.  Per-position results
-are returned too, so the choice is unambiguous and reproducible.
+``exponent_window_statistics`` examines every interval of consecutive numeric
+exponent values. For example, a width-3 window can be ``[120, 121, 122]``.
+The returned ``top`` entry is the interval containing the most tensor
+elements; per-position results are returned too, so the choice is
+unambiguous and reproducible.
 """
 
 from __future__ import annotations
@@ -220,7 +220,7 @@ class LayerTensorCapture:
 
 
 def exponent_values(tensor: torch.Tensor) -> torch.Tensor:
-    """Return the eight BF16 exponent bits for every element.
+    """Return the numeric BF16 exponent (0..255) for every element.
 
     The result is ``torch.int64`` and has the same shape as ``tensor``.  NaN,
     infinity, subnormal and zero values are intentionally not filtered: their
@@ -239,27 +239,19 @@ def exponent_values(tensor: torch.Tensor) -> torch.Tensor:
     return ((tensor.detach().contiguous().view(torch.uint16).to(torch.int64).cpu() >> 7) & 0xFF)
 
 
-def _window_result(exponents: torch.Tensor, width: int, start: int) -> dict[str, Any]:
-    shift = 8 - start - width
-    mask = (1 << width) - 1
-    values = ((exponents >> shift) & mask).reshape(-1)
-    counts = torch.bincount(values, minlength=1 << width)
-    max_count = int(counts.max().item()) if counts.numel() else 0
-    total = int(values.numel())
-    top_values = (
-        []
-        if total == 0
-        else [int(i) for i in torch.nonzero(counts == max_count, as_tuple=False).flatten()]
-    )
+def _window_result(
+    exponent_counts: torch.Tensor, total: int, width: int, start: int
+) -> dict[str, Any]:
+    """Count elements whose exponent lies in ``[start, start + width - 1]``."""
+    end = start + width - 1
+    count = int(exponent_counts[start : end + 1].sum().item())
     return {
-        "start_bit": start,
-        "end_bit": start + width - 1,
+        "start_value": start,
+        "end_value": end,
         "width": width,
-        "top_values": top_values,
-        "top_value": top_values[0] if top_values else None,
-        "top_bits": [format(i, f"0{width}b") for i in top_values],
-        "count": max_count,
-        "proportion": (max_count / total) if total else 0.0,
+        "values": list(range(start, end + 1)),
+        "count": count,
+        "proportion": (count / total) if total else 0.0,
         "total": total,
     }
 
@@ -268,15 +260,11 @@ def exponent_window_statistics(
     tensor: torch.Tensor,
     widths: Iterable[int] = (3, 7),
 ) -> dict[str, Any]:
-    """Compute most frequent consecutive exponent-bit values.
-
-    ``start_bit=0`` denotes the exponent's most-significant bit (BF16 bit 14);
-    ``start_bit=7`` denotes its least-significant bit (BF16 bit 7).  For each
-    requested width the global ``top`` is selected across all valid positions;
-    ``positions`` retains every position's result and ties are retained.
-    """
+    """Compute the most frequent consecutive numeric exponent-value windows."""
 
     exponents = exponent_values(tensor)
+    exponent_counts = torch.bincount(exponents.reshape(-1), minlength=256)
+    total = int(exponents.numel())
     result: dict[str, Any] = {
         "dtype": "bfloat16",
         "numel": int(tensor.numel()),
@@ -284,23 +272,23 @@ def exponent_window_statistics(
     }
     for width in widths:
         width = int(width)
-        if not 1 <= width <= 8:
-            raise ValueError(f"window width must be in [1, 8], got {width}")
-        positions = [_window_result(exponents, width, start) for start in range(9 - width)]
+        if not 1 <= width <= 256:
+            raise ValueError(f"window width must be in [1, 256], got {width}")
+        positions = [
+            _window_result(exponent_counts, total, width, start)
+            for start in range(257 - width)
+        ]
         # The denominator is the complete tensor for every candidate, so this
         # comparison is equivalent to comparing counts.
         best_count = max((entry["count"] for entry in positions), default=0)
         top = [entry for entry in positions if entry["count"] == best_count]
-        top_values = sorted({value for entry in top for value in entry["top_values"]})
+        top_ranges = [entry["values"] for entry in top]
         result["windows"][str(width)] = {
             "width": width,
             "top": top,
-            "top_values": top_values,
-            "top_value": top_values[0] if top_values else None,
-            "top_bits": [format(value, f"0{width}b") for value in top_values],
+            "top_ranges": top_ranges,
             "top_count": best_count,
             "top_proportion": (best_count / int(tensor.numel())) if tensor.numel() else 0.0,
-            "positions": positions,
         }
     return result
 
@@ -357,7 +345,7 @@ def analyze_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def summarize_tensor_report(report: Mapping[str, Any]) -> dict[str, Any]:
-    """Compact report containing the requested 3-bit and 7-bit answers."""
+    """Compact report containing the requested 3-value and 7-value windows."""
 
     windows = report.get("windows", {})
     summary: dict[str, Any] = {
@@ -366,9 +354,8 @@ def summarize_tensor_report(report: Mapping[str, Any]) -> dict[str, Any]:
     }
     for width in (3, 7):
         entry = windows.get(str(width), {}) if isinstance(windows, Mapping) else {}
-        summary[f"top_{width}_bit_values"] = entry.get("top_values", [])
-        summary[f"top_{width}_bit_patterns"] = entry.get("top_bits", [])
-        summary[f"top_{width}_bit_proportion"] = entry.get("top_proportion", 0.0)
+        summary[f"top_{width}_exponent_ranges"] = entry.get("top_ranges", [])
+        summary[f"top_{width}_exponent_proportion"] = entry.get("top_proportion", 0.0)
     return summary
 
 

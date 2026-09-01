@@ -1,7 +1,7 @@
-# FSDP Llama 训练与 BF16 指数位分析
+# FSDP Llama 训练与 BF16 指数值分析
 
 `train.py` 仍然使用 PyTorch FSDP（`fully_shard`）训练 Llama 模型；新增的
-`bf16_analysis.py` 负责在不改变训练图的情况下采集张量并统计 BF16 指数位。
+`bf16_analysis.py` 负责在不改变训练图的情况下采集张量并统计 BF16 指数值。
 
 ## 训练模式
 
@@ -66,7 +66,7 @@ FSDP2/DCP 将参数广播并切分到各 rank。模型必须是完整的 Transfo
 * `gradients/`：对应参数的梯度（以及可用时的 `layer_<N>.output` 激活梯度），没有梯度的参数记为 `null`。
 
 所有保存的张量都显式转为 BF16，并按 rank 和 step 写入
-`<tensor-dump-dir>/rank-<rank>/step-XXXXXXXX.pt`。同名 `.json` 文件包含指数位统计。
+`<tensor-dump-dir>/rank-<rank>/step-XXXXXXXX.pt`。同名 `.json` 文件包含指数值窗口统计。
 `--capture-freq 0`（默认值）关闭采集。
 
 注意：标准 Meta-Llama-3-8B 配置的 `num_hidden_layers` 是 32，因此合法的
@@ -74,13 +74,14 @@ FSDP2/DCP 将参数广播并切分到各 rank。模型必须是完整的 Transfo
 越界。若“第 32 层”指最后一个模块，请按 0-based 索引传入 `--target-layers 0 16 31`；
 如果使用确实包含第 32 号模块的模型，则无需修改默认值。
 
-## 指数位统计
+## 指数值窗口统计
 
-BF16 的指数域是 IEEE-754 编码中的 8 位（原始 BF16 bit 14 到 bit 7）。统计会在
-指数域内枚举所有滑动窗口：宽度 3 有 6 个位置，宽度 7 有 2 个位置。每个宽度的
-`top` 是占整个张量元素数比例最高的位置/数值（并保留并列项）；`top_value`、
-`top_bits` 和 `top_proportion` 是便于程序读取的摘要，`positions` 则给出每个位置的
-完整计数。
+BF16 的指数域是 IEEE-754 编码中的 8 位（数值范围 `0..255`，对应原始 BF16 bit 14
+到 bit 7）。统计会在指数数值上枚举所有连续区间：宽度 3 会检查
+`[0,1,2]` 到 `[253,254,255]`，宽度 7 会检查 `[0..6]` 到 `[249..255]`。每个宽度的
+`top` 是包含元素比例最高的连续指数值区间（并保留并列项）；每个区间包含
+`start_value`、`end_value`、`values`、`count` 和 `proportion`，`positions` 则给出所有
+可能起点的完整计数。这里统计的是指数的数值区间，不是指数部分的比特模式。
 
 直接分析一个快照或目录下的全部快照：
 
