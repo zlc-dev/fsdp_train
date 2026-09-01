@@ -247,12 +247,8 @@ def _window_result(
     count = int(exponent_counts[start : end + 1].sum().item())
     return {
         "start_value": start,
-        "end_value": end,
-        "width": width,
-        "values": list(range(start, end + 1)),
         "count": count,
         "proportion": (count / total) if total else 0.0,
-        "total": total,
     }
 
 
@@ -282,13 +278,8 @@ def exponent_window_statistics(
         # comparison is equivalent to comparing counts.
         best_count = max((entry["count"] for entry in positions), default=0)
         top = [entry for entry in positions if entry["count"] == best_count]
-        top_ranges = [entry["values"] for entry in top]
         result["windows"][str(width)] = {
-            "width": width,
-            "top": top,
-            "top_ranges": top_ranges,
-            "top_count": best_count,
-            "top_proportion": (best_count / int(tensor.numel())) if tensor.numel() else 0.0,
+            "top": top
         }
     return result
 
