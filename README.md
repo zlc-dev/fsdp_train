@@ -30,6 +30,33 @@ torchrun --nproc_per_node=8 train.py \
   --tensor-dump-dir outputs/llama3-posttrain/tensors --capture-freq 100
 ```
 
+直接加载本地 Hugging Face `safetensors` 预训练参数进行后训练：
+
+```bash
+export HF_HUB_OFFLINE=1
+
+torchrun --nproc_per_node=2 train.py \
+  --training-mode posttraining \
+  --model-init pretrained \
+  --local-files-only \
+  --model-name /data/models/Llama-3.1-8B-Instruct \
+  --dataset-name <local-or-cached-dataset> \
+  --experiment-name llama31-instruct-posttrain \
+  --target-layers 0 16 31 \
+  --batch-size 1 --seq-length 1024 \
+  --tensor-dump-dir outputs/llama31-instruct-posttrain/tensors \
+  --capture-freq 100
+```
+
+`--model-init pretrained` 会让 rank 0 在 CPU 中加载完整 Hugging Face 权重，再通过
+FSDP2/DCP 将参数广播并切分到各 rank。模型必须是完整的 Transformers 格式目录，
+至少包含 `config.json`、`model.safetensors.index.json`、所有
+`model-*.safetensors` 和 tokenizer 文件。`--local-files-only` 会禁止模型配置、权重
+和 tokenizer 访问 Hugging Face；数据集仍须位于本地或已经缓存。
+
+如果同时给出有效的 `--checkpoint-dir`，DCP checkpoint 优先，用于精确恢复模型、
+优化器、scheduler 和训练步数；此时不会重复加载 Hugging Face 权重。
+
 `post-training` 也是 `posttraining` 的可用拼写。默认目标层为 `0 16 32`，可用
 `--target-layers` 覆盖。采集在 backward 完成、`optimizer.zero_grad()` 之前进行，
 因此每个快照同时包含：

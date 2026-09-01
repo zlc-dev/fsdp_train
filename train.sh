@@ -1,4 +1,4 @@
-torchrun --nproc_per_node=8 train.py \
+torchrun --nproc_per_node=2 train.py \
   --training-mode pretraining \
   --model-name meta-llama/Meta-Llama-3-8B \
   --dataset-name tatsu-lab/alpaca \

@@ -1,5 +1,6 @@
 import argparse
 from contextlib import contextmanager
+import gc
 import json
 import multiprocessing
 import os
@@ -15,6 +16,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.fsdp import fully_shard, CPUOffloadPolicy, MixedPrecisionPolicy
 from torch.distributed.checkpoint.state_dict import (
     get_state_dict,
+    set_model_state_dict,
     set_state_dict,
     StateDictOptions,
 )
@@ -72,10 +74,54 @@ def main():
     dtype = torch.bfloat16
     torch.manual_seed(args.seed)
 
+    is_experiment = args.experiment_name is not None
+    exp_dir = Path(args.save_dir)
+    if is_experiment:
+        exp_dir = exp_dir / args.experiment_name
+
+    checkpoint_root = Path(args.checkpoint_dir) if args.checkpoint_dir else exp_dir
+    # Accept either an experiment directory or the DCP ``checkpoint/``
+    # directory itself on the command line.
+    checkpoint_id = (
+        checkpoint_root
+        if checkpoint_root.name == "checkpoint"
+        else checkpoint_root / "checkpoint"
+    )
+    checkpoint_state_root = (
+        checkpoint_root.parent
+        if checkpoint_root.name == "checkpoint"
+        else checkpoint_root
+    )
+    has_checkpoint_state = (checkpoint_state_root / "state.json").exists()
+    should_load_checkpoint = bool(args.checkpoint_dir) or (
+        is_experiment and has_checkpoint_state
+    )
+    if should_load_checkpoint and not checkpoint_id.exists():
+        raise FileNotFoundError(f"checkpoint directory not found: {checkpoint_id}")
+    if (
+        args.training_mode == "posttraining"
+        and args.model_init != "pretrained"
+        and not should_load_checkpoint
+    ):
+        raise ValueError(
+            "posttraining requires either --model-init pretrained or "
+            "--checkpoint-dir"
+        )
+    load_hf_pretrained = args.model_init == "pretrained" and not should_load_checkpoint
+    if args.model_init == "pretrained" and should_load_checkpoint:
+        LOGGER.info(
+            "DCP checkpoint %s takes precedence over --model-init pretrained",
+            checkpoint_id,
+        )
+
     # NOTE: meta device will not allocate any memory
     model: torch.nn.Module
     with rank0_first(), torch.device("meta"):
-        config = AutoConfig.from_pretrained(args.model_name, use_cache=False)
+        config = AutoConfig.from_pretrained(
+            args.model_name,
+            use_cache=False,
+            local_files_only=args.local_files_only,
+        )
         model = AutoModelForCausalLM.from_config(config, dtype=dtype)
     LOGGER.info(
         f"Training {sum(p.numel() for p in model.parameters())} model parameters"
@@ -110,10 +156,30 @@ def main():
     fsdp_model = fully_shard(model, **fsdp_config)
 
     model.to_empty(device="cpu" if args.cpu_offload else device)
-    model.apply(
-        lambda m: m.reset_parameters() if hasattr(m, "reset_parameters") else None
+    if load_hf_pretrained:
+        _load_huggingface_pretrained_weights(
+            model=model,
+            model_name=args.model_name,
+            config=config,
+            dtype=dtype,
+            rank=rank,
+            local_files_only=args.local_files_only,
+        )
+        initialization = f"Hugging Face pretrained weights from {args.model_name}"
+    else:
+        model.apply(
+            lambda m: m.reset_parameters() if hasattr(m, "reset_parameters") else None
+        )
+        initialization = (
+            "temporary random weights before DCP load"
+            if should_load_checkpoint
+            else "random weights"
+        )
+    LOGGER.info(
+        "Initialized model with %s; CUDA allocation is %.3f GB",
+        initialization,
+        get_mem_stats(device)["curr_alloc_gb"],
     )
-    LOGGER.info(f"Initialized model uses {get_mem_stats(device)['curr_alloc_gb']}gb")
 
     # NOTE: since this can download data, make sure to do the main process first
     # NOTE: This assumes that the data is on a **shared** network drive, accessible to all processes
@@ -135,12 +201,6 @@ def main():
         optimizer, T_max=1000, eta_min=args.lr * 1e-2
     )
 
-    is_experiment = False
-    exp_dir: Path = Path(args.save_dir)
-    if args.experiment_name is not None:
-        is_experiment = True
-        exp_dir = exp_dir / args.experiment_name
-
     # NOTE: full_state_dict=False means we will be saving sharded checkpoints.
     ckpt_opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
 
@@ -152,25 +212,6 @@ def main():
         "running_loss": 0,
     }
     resumed = False
-    checkpoint_root = Path(args.checkpoint_dir) if args.checkpoint_dir else exp_dir
-    # Accept either an experiment directory or the DCP ``checkpoint/``
-    # directory itself on the command line.
-    checkpoint_id = (
-        checkpoint_root
-        if checkpoint_root.name == "checkpoint"
-        else checkpoint_root / "checkpoint"
-    )
-    checkpoint_state_root = checkpoint_root.parent if checkpoint_root.name == "checkpoint" else checkpoint_root
-    has_checkpoint_state = (checkpoint_state_root / "state.json").exists()
-    if args.training_mode == "posttraining" and not args.checkpoint_dir and not has_checkpoint_state:
-        raise ValueError(
-            "posttraining requires --checkpoint-dir (a directory containing "
-            "checkpoint/) or an existing experiment directory"
-        )
-    should_load_checkpoint = (
-        bool(args.checkpoint_dir)
-        or (is_experiment and has_checkpoint_state)
-    )
     if should_load_checkpoint and checkpoint_id.exists():
         sharded_model_state, sharded_optimizer_state = get_state_dict(
             model, optimizer, options=ckpt_opts
@@ -192,15 +233,13 @@ def main():
                 torch.load(scheduler_path, map_location=device, weights_only=True)
             )
         else:
-            LOGGER.warning("No scheduler state at %s; using a fresh scheduler", scheduler_path)
+            LOGGER.warning(
+                "No scheduler state at %s; using a fresh scheduler", scheduler_path
+            )
         if has_checkpoint_state:
             with open(checkpoint_state_root / "state.json") as fp:
                 state = json.load(fp)
         resumed = True
-    elif should_load_checkpoint:
-        raise FileNotFoundError(
-            f"checkpoint directory not found: {checkpoint_id}"
-        )
     if is_experiment:
         LOGGER.info(f"Resumed={resumed} | {state}")
     dist.barrier()
@@ -341,6 +380,68 @@ def main():
         tensor_capture.close()
 
 
+def _load_huggingface_pretrained_weights(
+    model: torch.nn.Module,
+    model_name: str,
+    config,
+    dtype: torch.dtype,
+    rank: int,
+    local_files_only: bool,
+) -> None:
+    """Load a Hugging Face full state dict on rank 0 and shard it with DCP.
+
+    ``model`` has already been constructed on meta, wrapped with FSDP2 and
+    materialized with ``to_empty``.  Only rank 0 constructs the full source
+    model, so the other ranks do not each need another ~16 GB CPU copy of an
+    8B BF16 checkpoint.  ``set_model_state_dict`` distributes each tensor into
+    the DTensor shards owned by the FSDP2 model.
+    """
+
+    full_state_dict = {}
+    pretrained_model = None
+    if rank == 0:
+        LOGGER.info("Loading Hugging Face pretrained weights from %s", model_name)
+        pretrained_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            config=config,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+            local_files_only=local_files_only,
+        )
+        full_state_dict = pretrained_model.state_dict()
+        meta_keys = [
+            name for name, tensor in full_state_dict.items() if tensor.is_meta
+        ]
+        if meta_keys:
+            raise RuntimeError(
+                "Hugging Face left parameters on the meta device; the local "
+                f"checkpoint is probably incomplete. First keys: {meta_keys[:5]}"
+            )
+
+    incompatible = set_model_state_dict(
+        model=model,
+        model_state_dict=full_state_dict,
+        options=StateDictOptions(
+            full_state_dict=True,
+            broadcast_from_rank0=True,
+            strict=True,
+        ),
+    )
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "pretrained state dict did not exactly match the model: "
+            f"missing={incompatible.missing_keys}, "
+            f"unexpected={incompatible.unexpected_keys}"
+        )
+
+    # state_dict tensors alias the source module parameters, so both objects
+    # must stay alive until set_model_state_dict has finished on every rank.
+    del full_state_dict
+    del pretrained_model
+    gc.collect()
+    LOGGER.info("Hugging Face pretrained parameters loaded and sharded successfully")
+
+
 def _load_and_preprocess_data(args, config):
     """
     Function created using code found in
@@ -348,7 +449,10 @@ def _load_and_preprocess_data(args, config):
     """
     from itertools import chain
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name,
+        local_files_only=args.local_files_only,
+    )
 
     data = datasets.load_dataset(args.dataset_name, args.dataset_subset)
 
@@ -471,7 +575,21 @@ def _get_parser() -> argparse.ArgumentParser:
         "--training-mode",
         choices=("pretraining", "posttraining", "post-training"),
         default="pretraining",
-        help="initialize randomly (pretraining) or load --checkpoint-dir first",
+        help="experiment label; posttraining requires pretrained or DCP initialization",
+    )
+    parser.add_argument(
+        "--model-init",
+        choices=("random", "pretrained"),
+        default="random",
+        help=(
+            "initialize parameters randomly or load Hugging Face weights from "
+            "--model-name (default: random)"
+        ),
+    )
+    parser.add_argument(
+        "--local-files-only",
+        action="store_true",
+        help="never contact Hugging Face Hub for model config, weights, or tokenizer",
     )
     parser.add_argument(
         "--checkpoint-dir",
