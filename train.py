@@ -32,14 +32,26 @@ from transformers import (
     default_data_collator,
 )
 
-# fixes for reset_parameters not existing
 from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
 
 def reset_rope(self: LlamaRotaryEmbedding):
-    self.inv_freq, self.attention_scaling = self.rope_init_fn(
-        self.config, self.inv_freq.device
-    )
-    self.original_inv_freq = self.inv_freq
+    rope_init_fn = getattr(self, "rope_init_fn", None)
+    if rope_init_fn is None:
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+        rope_type = getattr(self, "rope_type", "default")
+        if rope_type == "default":
+            rope_init_fn = self.compute_default_rope_parameters
+        else:
+            try:
+                rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
+            except KeyError as exc:
+                raise ValueError(f"Unsupported RoPE type: {rope_type!r}") from exc
+
+    device = self.inv_freq.device
+    self.inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
+    # Keep the original frequencies independent of later dynamic-RoPE updates.
+    self.original_inv_freq = self.inv_freq.clone()
 
 
 LlamaRMSNorm.reset_parameters = lambda self: torch.nn.init.ones_(self.weight)
@@ -358,7 +370,7 @@ def main():
                 for t in timers.values():
                     t.reset()
 
-            if is_experiment and state["global_step"] % args.ckpt_freq == 0:
+            if is_experiment and args.ckpt_freq > 0 and state["global_step"] % args.ckpt_freq == 0:
                 dist.barrier()
                 # NOTE: we have to call this on ALL ranks
                 sharded_model_state, sharded_optimizer_state = get_state_dict(
@@ -567,7 +579,7 @@ def _get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", default=3e-5, type=float)
     parser.add_argument("-b", "--batch-size", default=1, type=int)
     parser.add_argument("--log-freq", default=10, type=int)
-    parser.add_argument("--ckpt-freq", default=500, type=int)
+    parser.add_argument("--ckpt-freq", default=0, type=int)
     parser.add_argument("-s", "--seq-length", default=1024, type=int)
     parser.add_argument("--cpu-offload", default=False, action="store_true")
     parser.add_argument("--forward-prefetch-distance", default=1, type=int)

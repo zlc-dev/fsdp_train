@@ -1,5 +1,6 @@
 torchrun --nproc_per_node=2 train.py \
   --training-mode pretraining \
+  --model-init random \
   --model-name meta-llama/Meta-Llama-3-8B \
   --dataset-name tatsu-lab/alpaca \
   --experiment-name llama3-pretrain \
