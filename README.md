@@ -4,8 +4,9 @@
 `--precision fp8` 选择训练精度，并包含数据、FSDP、checkpoint、训练循环和
 W&B 监控逻辑。
 
-FP8 版本通过 `torchao.float8` 将满足硬件维度约束的 `Linear` forward/backward
-GEMM 操作量化为 E5M2；模型主参数、优化器状态、FSDP 通信和其他算子仍使用 BF16。
+FP8 版本通过 `torchao.float8` 将满足硬件维度约束的 `Linear` GEMM 操作量化：
+forward 的 input/weight 使用硬件支持更广的 E4M3，gradient output 使用 E5M2；模型主参数、
+优化器状态、FSDP 通信和其他算子仍使用 BF16。
 不满足输入/输出维度 16 对齐要求的 Linear 层会自动保留 BF16。FP8 训练需要安装与
 PyTorch 版本匹配的 `torchao`，并使用支持 FP8 的 GPU。
 
@@ -30,7 +31,7 @@ torchrun --nproc_per_node=8 train.py \
   --tensor-dump-dir outputs/llama3-pretrain/tensors --capture-freq 100
 ```
 
-使用 E5M2 FP8 训练时切换精度参数：
+使用 FP8 训练时切换精度参数：
 
 ```bash
 torchrun --nproc_per_node=8 train.py \

@@ -34,6 +34,13 @@ from transformers import (
 
 from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
 
+from torchao.float8 import (
+    CastConfig,
+    Float8LinearConfig,
+    ScalingType,
+    convert_to_float8_training,
+)
+
 def reset_rope(self: LlamaRotaryEmbedding):
     rope_init_fn = getattr(self, "rope_init_fn", None)
     if rope_init_fn is None:
@@ -61,28 +68,25 @@ LlamaRotaryEmbedding.reset_parameters = reset_rope
 LOGGER = logging.getLogger(__name__)
 
 
-def convert_linears_to_e5m2(model: torch.nn.Module) -> torch.nn.Module:
-    """Use E5M2 operands for eligible Linear forward/backward GEMMs."""
-    try:
-        from torchao.float8 import (
-            CastConfig,
-            Float8LinearConfig,
-            ScalingType,
-            convert_to_float8_training,
-        )
-    except ImportError as exc:
-        raise RuntimeError(
-            "FP8 training requires torchao. Install a torchao version compatible "
-            "with the installed PyTorch build."
-        ) from exc
+def convert_linears_to_fp8(model: torch.nn.Module) -> torch.nn.Module:
+    """Use hardware-supported FP8 operands for eligible Linear GEMMs.
 
+    CUDA ``scaled_mm`` implementations generally do not support E5M2 x E5M2
+    for the forward GEMM. Use E4M3 for input/weight forward operands and E5M2
+    for gradient outputs, which is the torchao-supported mixed configuration.
+    """
+
+    e4m3 = CastConfig(
+        scaling_type=ScalingType.DYNAMIC,
+        target_dtype=torch.float8_e4m3fn,
+    )
     e5m2 = CastConfig(
         scaling_type=ScalingType.DYNAMIC,
         target_dtype=torch.float8_e5m2,
     )
     config = Float8LinearConfig(
-        cast_config_input=e5m2,
-        cast_config_weight=e5m2,
+        cast_config_input=e4m3,
+        cast_config_weight=e4m3,
         cast_config_grad_output=e5m2,
     )
 
@@ -105,7 +109,7 @@ def convert_linears_to_e5m2(model: torch.nn.Module) -> torch.nn.Module:
         ),
     )
     LOGGER.info(
-        "Converted %d Linear layers to FP8 E5M2; kept %d incompatible layers in BF16",
+        "Converted %d Linear layers to FP8 (E4M3 forward, E5M2 gradients); kept %d incompatible layers in BF16",
         len(eligible),
         len(skipped),
     )
@@ -190,7 +194,7 @@ def main():
         )
         model = AutoModelForCausalLM.from_config(config, dtype=dtype)
         if args.precision == "fp8":
-            model = convert_linears_to_e5m2(model)
+            model = convert_linears_to_fp8(model)
     LOGGER.info(
         "Training %d model parameters with %s",
         sum(p.numel() for p in model.parameters()),
@@ -503,7 +507,7 @@ def _init_wandb(args, rank: int, world_size: int, precision_name: str):
         config={
             **vars(args),
             "precision": precision_name,
-            "fp8_format": "E5M2" if precision_name == "fp8" else None,
+            "fp8_format": "E4M3 forward / E5M2 gradients" if precision_name == "fp8" else None,
             "world_size": world_size,
         },
     )
@@ -699,7 +703,7 @@ def _get_parser() -> argparse.ArgumentParser:
         "--precision",
         choices=("bf16", "fp8"),
         default="bf16",
-        help="training precision; fp8 uses E5M2 for eligible Linear GEMMs",
+        help="training precision; fp8 uses E4M3 forward and E5M2 gradient operands",
     )
     parser.add_argument("--num-epochs", default=100, type=int)
     parser.add_argument("--lr", default=3e-5, type=float)
