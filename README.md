@@ -108,8 +108,9 @@ FSDP2/DCP 将参数广播并切分到各 rank。模型必须是完整的 Transfo
 * `activations/`：该层输入和 forward 返回的 hidden-state（若返回 tuple，取第一个张量）；
 * `gradients/`：对应参数的梯度（以及可用时的 `layer_<N>.output` 激活梯度），没有梯度的参数记为 `null`。
 
-所有保存的张量都显式转为 BF16，并按 rank 和 step 写入
-`<tensor-dump-dir>/rank-<rank>/step-XXXXXXXX.pt`。同名 `.json` 文件包含指数值窗口统计。
+保存的张量保持采集时的原始 dtype，并按 rank 和 step 写入
+`<tensor-dump-dir>/rank-<rank>/step-XXXXXXXX.pt`。训练阶段不做任何 FP16/BF16/FP8
+数值统计；FP8 E5M2 转换和统计请在单独的离线分析项目中完成。
 `--capture-freq 0`（默认值）关闭采集。
 
 注意：标准 Meta-Llama-3-8B 配置的 `num_hidden_layers` 是 32，因此合法的
@@ -117,24 +118,4 @@ FSDP2/DCP 将参数广播并切分到各 rank。模型必须是完整的 Transfo
 越界。若“第 32 层”指最后一个模块，请按 0-based 索引传入 `--target-layers 0 16 31`；
 如果使用确实包含第 32 号模块的模型，则无需修改默认值。
 
-## 指数值窗口统计
-
-BF16 的指数域是 IEEE-754 编码中的 8 位（数值范围 `0..255`，对应原始 BF16 bit 14
-到 bit 7）。统计会在指数数值上枚举所有连续区间：宽度 3 会检查
-`[0,1,2]` 到 `[253,254,255]`，宽度 7 会检查 `[0..6]` 到 `[249..255]`。每个宽度的
-`top` 是包含元素比例最高的连续指数值区间（并保留并列项）；每个区间包含
-`start_value`、`end_value`、`values`、`count` 和 `proportion`，`positions` 则给出所有
-可能起点的完整计数。这里统计的是指数的数值区间，不是指数部分的比特模式。
-
-直接分析一个快照或目录下的全部快照：
-
-```bash
-python analyze_bf16.py outputs/llama3-pretrain/tensors \
-  --output outputs/llama3-pretrain/exponent-statistics.json
-```
-
-分析目录时，JSON 同时保留每个 rank/step 的结果，并在 `aggregated` 节点中按 step
-合并各 rank 的展平元素；其中的比例对应完整逻辑张量（而不是单个 FSDP shard）。
-
-统计包含零、非规格化数、无穷大和 NaN 的指数编码；不会静默丢弃任何元素。梯度为
-`null` 的参数没有元素，因而不会出现在统计结果中。
+本项目不再提供离线统计入口；请在单独的离线分析项目中读取这些 `.pt` 快照。

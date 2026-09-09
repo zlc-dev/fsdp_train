@@ -24,7 +24,7 @@ from torch.distributed.checkpoint import load, save
 
 import tqdm
 import datasets
-from bf16_analysis import LayerTensorCapture, analyze_snapshot
+from bf16_analysis import LayerTensorCapture
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -392,13 +392,7 @@ def main():
                     / f"step-{capture_step:08d}.pt"
                 )
                 tensor_capture.save_snapshot(snapshot, capture_path)
-                stats_path = capture_path.with_suffix(".json")
-                stats_path.write_text(
-                    json.dumps(analyze_snapshot(snapshot), indent=2, ensure_ascii=False)
-                    + "\n",
-                    encoding="utf-8",
-                )
-                LOGGER.info("Saved BF16 tensors and exponent statistics to %s", capture_path)
+                LOGGER.info("Saved raw tensors to %s", capture_path)
 
             with timers["update"], torch.profiler.record_function("STEP::update"):
                 optimizer.step()
@@ -743,7 +737,7 @@ def _get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tensor-dump-dir",
         default=None,
-        help="directory for per-rank BF16 layer snapshots and JSON statistics",
+        help="directory for per-rank raw layer tensor snapshots",
     )
     parser.add_argument(
         "--target-layers",
