@@ -1,7 +1,20 @@
-# FSDP Llama 训练与 BF16 指数值分析
+# FSDP Llama BF16/FP8 训练与数值分析
 
-`train.py` 仍然使用 PyTorch FSDP（`fully_shard`）训练 Llama 模型；新增的
-`bf16_analysis.py` 负责在不改变训练图的情况下采集张量并统计 BF16 指数值。
+`train.py` 是统一训练入口，通过 `--precision bf16` 或
+`--precision fp8` 选择训练精度，并包含数据、FSDP、checkpoint、训练循环和
+W&B 监控逻辑。
+
+FP8 版本通过 `torchao.float8` 将满足硬件维度约束的 `Linear` forward/backward
+GEMM 操作量化为 E5M2；模型主参数、优化器状态、FSDP 通信和其他算子仍使用 BF16。
+不满足输入/输出维度 16 对齐要求的 Linear 层会自动保留 BF16。FP8 训练需要安装与
+PyTorch 版本匹配的 `torchao`，并使用支持 FP8 的 GPU。
+
+额外依赖可安装为：
+
+```bash
+pip install wandb torchao
+wandb login
+```
 
 ## 训练模式
 
@@ -9,11 +22,23 @@
 
 ```bash
 torchrun --nproc_per_node=8 train.py \
+  --precision bf16 \
   --training-mode pretraining \
   --model-name meta-llama/Meta-Llama-3-8B \
   --dataset-name <dataset> --experiment-name llama3-pretrain \
   --target-layers 0 16 31 \
   --tensor-dump-dir outputs/llama3-pretrain/tensors --capture-freq 100
+```
+
+使用 E5M2 FP8 训练时切换精度参数：
+
+```bash
+torchrun --nproc_per_node=8 train.py \
+  --precision fp8 \
+  --training-mode pretraining \
+  --model-name meta-llama/Meta-Llama-3-8B \
+  --dataset-name <dataset> --experiment-name llama3-fp8 \
+  --wandb-project fsdp-llama
 ```
 
 基于本项目生成的 DCP 检查点进行后训练。`--checkpoint-dir` 指向包含
@@ -22,6 +47,7 @@ torchrun --nproc_per_node=8 train.py \
 
 ```bash
 torchrun --nproc_per_node=8 train.py \
+  --precision bf16 \
   --training-mode posttraining \
   --checkpoint-dir outputs/llama3-pretrain \
   --model-name meta-llama/Meta-Llama-3-8B \
@@ -36,6 +62,7 @@ torchrun --nproc_per_node=8 train.py \
 export HF_HUB_OFFLINE=1
 
 torchrun --nproc_per_node=2 train.py \
+  --precision bf16 \
   --training-mode posttraining \
   --model-init pretrained \
   --local-files-only \
@@ -56,6 +83,22 @@ FSDP2/DCP 将参数广播并切分到各 rank。模型必须是完整的 Transfo
 
 如果同时给出有效的 `--checkpoint-dir`，DCP checkpoint 优先，用于精确恢复模型、
 优化器、scheduler 和训练步数；此时不会重复加载 Hugging Face 权重。
+
+## W&B 监控
+
+默认只有 rank 0 创建 W&B run，并每隔 `--log-freq` 步记录跨所有 rank 平均后的
+`train/loss`，以及学习率、epoch 进度、tokens/s、各训练阶段耗时和 CUDA 显存。
+首次在线使用前运行 `wandb login`。常用参数如下：
+
+```bash
+--wandb-project fsdp-llama \
+--wandb-entity <team> \
+--wandb-run-id <stable-id> \
+--wandb-mode online
+```
+
+`--wandb-run-id` 可在 checkpoint 恢复时续写同一个 run；无网络环境可使用
+`--wandb-mode offline`，完全禁用则使用 `--wandb-mode disabled`。
 
 `post-training` 也是 `posttraining` 的可用拼写。默认目标层为 `0 16 32`，可用
 `--target-layers` 覆盖。采集在 backward 完成、`optimizer.zero_grad()` 之前进行，

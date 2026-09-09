@@ -60,6 +60,60 @@ LlamaRotaryEmbedding.reset_parameters = reset_rope
 
 LOGGER = logging.getLogger(__name__)
 
+
+def convert_linears_to_e5m2(model: torch.nn.Module) -> torch.nn.Module:
+    """Use E5M2 operands for eligible Linear forward/backward GEMMs."""
+    try:
+        from torchao.float8 import (
+            CastConfig,
+            Float8LinearConfig,
+            ScalingType,
+            convert_to_float8_training,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "FP8 training requires torchao. Install a torchao version compatible "
+            "with the installed PyTorch build."
+        ) from exc
+
+    e5m2 = CastConfig(
+        scaling_type=ScalingType.DYNAMIC,
+        target_dtype=torch.float8_e5m2,
+    )
+    config = Float8LinearConfig(
+        cast_config_input=e5m2,
+        cast_config_weight=e5m2,
+        cast_config_grad_output=e5m2,
+    )
+
+    eligible = []
+    skipped = []
+    for name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        if module.in_features % 16 == 0 and module.out_features % 16 == 0:
+            eligible.append(name)
+        else:
+            skipped.append(name)
+
+    eligible_set = set(eligible)
+    convert_to_float8_training(
+        model,
+        config=config,
+        module_filter_fn=lambda module, fqn: (
+            not isinstance(module, torch.nn.Linear) or fqn in eligible_set
+        ),
+    )
+    LOGGER.info(
+        "Converted %d Linear layers to FP8 E5M2; kept %d incompatible layers in BF16",
+        len(eligible),
+        len(skipped),
+    )
+    if skipped:
+        LOGGER.debug("BF16 Linear layers: %s", skipped)
+    return model
+
+
 @record
 def main():
     parser = _get_parser()
@@ -135,8 +189,12 @@ def main():
             local_files_only=args.local_files_only,
         )
         model = AutoModelForCausalLM.from_config(config, dtype=dtype)
+        if args.precision == "fp8":
+            model = convert_linears_to_e5m2(model)
     LOGGER.info(
-        f"Training {sum(p.numel() for p in model.parameters())} model parameters"
+        "Training %d model parameters with %s",
+        sum(p.numel() for p in model.parameters()),
+        args.precision,
     )
 
     fsdp_config = dict(
@@ -268,6 +326,14 @@ def main():
         (exp_dir / f"rank-{rank}").mkdir(parents=True, exist_ok=True)
         LOGGER.info(f"Worker saving to {exp_dir / f'rank-{rank}'}")
 
+    wandb_run = _init_wandb(
+        args=args,
+        rank=rank,
+        world_size=world_size,
+        precision_name=args.precision,
+    )
+    dist.barrier()
+
     tensor_capture = None
     if args.tensor_dump_dir:
         tensor_capture = LayerTensorCapture(model, args.target_layers)
@@ -363,7 +429,33 @@ def main():
                     },
                 }
 
+                loss = torch.tensor(info["running_loss"], device=device)
+                dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+                info["running_loss"] = loss.item() / world_size
+
                 LOGGER.info(info)
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {
+                            "global_step": info["global_step"],
+                            "train/loss": info["running_loss"],
+                            "train/learning_rate": info["lr"],
+                            "train/epoch": info["epoch"],
+                            "train/epoch_progress": info["epoch_progress"],
+                            "performance/tokens_per_second": info["tokens_per_s"],
+                            **{
+                                f"system/{key}": value
+                                for key, value in info.items()
+                                if key.endswith("_gb")
+                            },
+                            **{
+                                key: value
+                                for key, value in info.items()
+                                if key.startswith("time/")
+                            },
+                        },
+                        step=state["global_step"],
+                    )
 
                 torch.cuda.reset_peak_memory_stats(device)
                 state["running_loss"] = 0
@@ -390,6 +482,40 @@ def main():
 
     if tensor_capture is not None:
         tensor_capture.close()
+    if wandb_run is not None:
+        wandb_run.finish()
+    dist.destroy_process_group()
+
+
+def _init_wandb(args, rank: int, world_size: int, precision_name: str):
+    if rank != 0 or args.wandb_mode == "disabled":
+        return None
+
+    try:
+        import wandb
+    except ImportError as exc:
+        raise RuntimeError(
+            "Weights & Biases monitoring is enabled but wandb is not installed. "
+            "Install it with `pip install wandb`, or pass --wandb-mode disabled."
+        ) from exc
+
+    run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.experiment_name,
+        id=args.wandb_run_id,
+        resume="allow" if args.wandb_run_id else None,
+        mode=args.wandb_mode,
+        config={
+            **vars(args),
+            "precision": precision_name,
+            "fp8_format": "E5M2" if precision_name == "fp8" else None,
+            "world_size": world_size,
+        },
+    )
+    run.define_metric("global_step")
+    run.define_metric("*", step_metric="global_step")
+    return run
 
 
 def _load_huggingface_pretrained_weights(
@@ -575,6 +701,12 @@ def _get_parser() -> argparse.ArgumentParser:
     parser.add_argument("-m", "--model-name", default=None, required=True)
     parser.add_argument("--save-dir", default="../outputs")
     parser.add_argument("--seed", default=0, type=int)
+    parser.add_argument(
+        "--precision",
+        choices=("bf16", "fp8"),
+        default="bf16",
+        help="training precision; fp8 uses E5M2 for eligible Linear GEMMs",
+    )
     parser.add_argument("--num-epochs", default=100, type=int)
     parser.add_argument("--lr", default=3e-5, type=float)
     parser.add_argument("-b", "--batch-size", default=1, type=int)
@@ -627,6 +759,23 @@ def _get_parser() -> argparse.ArgumentParser:
         default=0,
         metavar="N",
         help="capture every N optimizer steps; 0 disables capture (default)",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        default="fsdp-train",
+        help="Weights & Biases project name (default: fsdp-train)",
+    )
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument(
+        "--wandb-run-id",
+        default=None,
+        help="stable W&B run ID to resume the same run after a restart",
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        choices=("online", "offline", "disabled"),
+        default="online",
+        help="W&B logging mode (default: online)",
     )
     return parser
 

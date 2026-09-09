@@ -1,4 +1,5 @@
 torchrun --nproc_per_node=2 train.py \
+  --precision bf16 \
   --training-mode pretraining \
   --model-init random \
   --model-name meta-llama/Meta-Llama-3-8B \
